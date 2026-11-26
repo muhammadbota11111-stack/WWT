@@ -1,0 +1,406 @@
+[11/26, 11:13 AM] Loading....: import json
+from pathlib import Path
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+import yfinance as yf
+
+# BOTA PREDICTION APP v2.0
+# Educational market-analysis / paper-testing tool only.
+# Yahoo Finance data may be delayed, incomplete, or unavailable.
+
+st.set_page_config(page_title="BOTA Prediction App", page_icon="📈", layout="wide")
+
+DATA_DIR = Path(".")
+JOURNAL_FILE = DATA_DIR / "bota_trade_journal.csv"
+CONCEPTS_FILE = DATA_DIR / "bota_concepts.json"
+
+st.title("📈 BOTA PREDICTION APP")
+st.caption("Gold market analysis • Evidence-based signals • Historical testing • Paper mode")
+
+st.warning(
+    "Educational tool only. Signals are estimates, not guarantees or financial advice. "
+    "Do not use this app as an instruction to place real-money trades."
+)
+
+# -------------------- Data --------------------
+@st.cache_data(ttl=300, show_spinner=False)
+def load_history(ticker: str, period: str = "2y", interval: str = "1d"):
+    raw = yf.download(
+        ticker,
+        period=period,
+        interval=interval,
+        auto_adjust=True,
+        progress=False,
+        threads=False,
+    )
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+
+    # yfinance may return either flat columns or a MultiIndex.
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = raw.columns.get_level_values(0)
+
+    raw = raw.rename(columns=str.title)
+    needed = ["Open", "High", "Low", "Close", "Volume"]
+    for col in needed:
+        if col not in raw.columns:
+            raw[col] = np.nan
+
+    out = raw[needed].copy()
+    out = out.dropna(subset=["Close"])
+    out.index = pd.to_datetime(out.index)
+    if getattr(out.index, "tz", None) is not None:
+        out.index = out.index.tz_localize(None)
+    return out
+
+
+def rsi(series: pd.Series, length: int = 14):
+    delta = series.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / length, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / length, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def add_indicators(df: pd.DataFrame):
+    x = df.copy()
+    close = x["Close"]
+    x["EMA20"] = close.ewm(span=20, adjust=False).mean()
+    x["EMA50"] = close.ewm(span=50, adjust=False).mean()
+    x["EMA200"] = close.ewm(span=200, adjust=False).mean()
+    x["RSI14"] = rsi(close)
+    fast = close.ewm(span=12, adjust=False).mean()
+    slow = close.ewm(span=26, adjust=False).mean()
+    x["MACD"] = fast - slow
+    x["MACD_Signal"] = x["MACD"].ewm(span=9, adjust=False).mean()
+
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            x["High"] - x["Low"],
+            (x["High"] - prev_close).abs(),
+            (x["Low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    x["ATR14"] = tr.rolling(14).mean()
+    return x
+
+
+def get_latest_signal(gold: pd.DataFrame, dxy: pd.DataFrame, us10y: pd.DataFrame):
+    g = add_indicators(gold).dropna(subset=["EMA50", "RSI14", "MACD_Signal", "ATR14"])
+    if len(g) < 5:
+        return None, []
+
+    latest = g.iloc[-1]
+    reasons = []
+    score = 0
+
+    if latest["Close"] > latest["EMA20"] > latest["EMA50"]:
+        score += 2
+        reasons.append("Gold price EMA20 te EMA50 ton uppar: short/medium trend positive.")
+    elif latest["Close"] < latest["EMA20"] < latest["EMA50"]:
+        score -= 2
+        reasons.append("Gold price EMA20 te EMA50 ton thalle: short/medium trend negative.")
+    else:
+        reasons.append("Gold EMAs mixed ne: trend confirmation weak hai.")
+
+    if latest["MACD"] > latest["MACD_Signal"]:
+        score += 1
+        reasons.append("MACD bullish momentum show kar reha hai.")
+    else:
+        score -= 1
+        reasons.append("MACD bearish momentum show kar reha hai.")
+
+    if latest["RSI14"] >= 55:
+        score += 1
+        reasons.append(f"RSI {latest['RSI14']:.1f}: momentum bullish side te hai.")
+    elif latest["RSI14"] <= 45:
+        score -= 1
+        reasons.append(f"RSI {latest['RSI14']:.1f}: momentum bearish side te hai.")
+    else:
+        reasons.append(f"RSI {latest['RSI14']:.1f}: neutral zone.")
+
+    # Cross-market context: compare most recent daily changes by date.
+    for label, frame, points_if_down in [
+        ("DXY", dxy, 1),
+        ("US10Y yield", us10y, 1),
+    ]:
+        if not frame.empty and len(frame) >= 2:
+            s = frame["Close"].dropna()
+            change = (s.iloc[-1] / s.iloc[-2] - 1) * 100
+            if change < -0.10:
+                score += points_if_down
+                reasons.append(f"{label} latest daily change {change:.2f}%: Gold layi supportive context.")
+            elif change > 0.10:
+                score -= points_if_down
+                reasons.append(f"{label} latest daily change +{change:.2f}%: Gold layi pressure ho sakda hai.")
+            else:
+                reasons.append(f"{label} daily move chhota hai ({change:.2f}%): neutral context.")
+        else:
+            reasons.append(f"{label} data available nahi; cross-market point add nahi hoya.")
+
+    if score >= 3:
+        signal = "BUY BIAS"
+    elif score <= -3:
+        signal = "SELL BIAS"
+    else:
+        signal = "WAIT / NO CLEAR EDGE"
+
+    # This is a rule score, not a probability.
+    strength = min(100, int(abs(score) / 6 * 100))
+    return {
+        "signal": signal,
+        "score": score,
+        "strength": strength,
+        "price": float(latest["Close"]),
+        "rsi": float(latest["RSI14"]),
+        "ema20": float(latest["EMA20"]),
+        "ema50": float(latest["EMA50"]),
+        "atr": float(latest["ATR14"]),
+        "date": g.index[-1],
+    }, reasons
+
+
+def backtest_signals(gold: pd.DataFrame, dxy: pd.DataFrame, us10y: pd.DataFrame):
+    """Signal at close t is tested against close-to-close return t -> t+1."""
+    g = add_indicators(gold)
+    features = pd.DataFrame(index=g.index)
+    features["gold_close"] = g["Close"]
+    features["ema20"] = g["EMA20"]
+    features["ema50"] = g["EMA50"]
+    features["rsi"] = g["RSI14"]
+    features["macd"] = g["MACD"]
+    features["macd_signal"] = g["MACD_Signal"]
+
+    def daily_pct(frame):
+        if frame.empty:
+            return pd.Series(dtype=float)
+        s = frame["Close"].dropna().pct_change() * 100
+        return s
+
+    features["dxy_change"] = daily_pct(dxy).reindex(features.index).fillna(0)
+    features["yield_change"] = daily_pct(us10y).reindex(features.index).fillna(0)
+
+    score = pd.Series(0, index=features.index, dtype=float)
+    score += np.where(
+        (features["gold_close"] > features["ema20"]) & (features["ema20"] > features["ema50"]),
+        2,
+        np.where(
+            (features["gold_close"] < features["ema20"]) & (features["ema20"] < features["ema50"]),
+            -2,
+            0,
+        ),
+    )
+    score += np.where(features["macd"] > features["macd_signal"], 1, -1)
+    score += np.where(features["rsi"] >= 55, 1, np.where(features["rsi"] <= 45, -1, 0))
+    score += np.where(features["dxy_change"] < -0.10, 1, np.where(features["dxy_change"] > 0.10, -1, 0))
+    score += np.where(features["yield_change"] < -0.10, 1, np.where(features["yield_change"] > 0.10, -1, 0))
+
+    direction = pd.Series(0, index=features.index)
+    direction[score >= 3] = 1
+    direction[score <= -3] = -1
+
+    next_return = features["gold_close"].shift(-1) / features["gold_close"] - 1
+    tested = pd.DataFrame({"signal": direction, "next_return": next_return}).dropna()
+    tested = tested[tested["signal"] != 0]
+    if tested.empty:
+        return tested, None
+
+    tested["correct"] = np.where(
+        tested["signal"] == 1,
+        tested["next_return"] > 0,
+        tested["next_return"] < 0,
+    )
+    return tested, {
+        "trades": int(len(tested)),
+        "accuracy": float(tested["correct"].mean() * 100),
+        "avg_return": float(tested["next_return"].mean() * 100),
+    }
+
+
+# -------------------- Sidebar --------------------
+st.sidebar.header("Settings")
+period = st.sidebar.selectbox("Historical data", ["1y", "2y", "5y", "max"], index=1)
+st.sidebar.caption("Data refresh: every 5 minutes. Provider: Yahoo Finance (may be delayed).")
+if st.sidebar.button("Refresh market data"):
+    st.cache_data.clear()
+    st.rerun()
+
+# Gold futures proxy, US Dollar Index, and US 10-year Treasury yield.
+gold = load_history("GC=F", period)
+dxy = load_history("DX-Y.NYB", period)
+us10y = load_history("^TNX", period)
+
+if gold.empty:
+    st.error("Gold data load nahi hoya. Internet/ticker availability check karo te Refresh dabao.")
+    st.stop()
+
+signal, reasons = get_latest_signal(gold, dxy, us10y)
+
+# -------------------- Main signal --------------------
+st.subheader("🧭 Latest Gold analysis")
+if signal:
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Gold futures proxy", f"${signal['price']:,.2f}")
+    c2.metric("Rule-based signal", signal["signal"])
+    c3.metric("Rule strength (not probability)", f"{signal['strength']} / 100")
+    c4.metric("RSI 14", f"{signal['rsi']:.1f}")
+
+    st.caption(f"Latest available daily candle: {signal['date'].strftime('%Y-%m-%d')}")
+    st.info("Signal is based on the latest completed daily data. It is not a guaranteed forecast for tomorrow.")
+    st.markdown("**Signal reasons**")
+    for reason in reasons:
+        st.write(f"- {reason}")
+else:
+    st.warning("Indicators layi data kaafi nahi.")
+
+st.divider()
+
+# -------------------- Market meters --------------------
+st.subheader("📊 Market context")
+m1, m2, m3 = st.columns(3)
+
+def latest_value(frame):
+    if frame.empty:
+        return None
+    s = frame["Close"].dropna()
+    return float(s.iloc[-1]) if not s.empty else None
+
+dxy_value = latest_value(dxy)
+yield_value = latest_value(us10y)
+
+with m1:
+    st.metric("DXY index", f"{dxy_value:.2f}" if dxy_value is not None else "Unavailable")
+with m2:
+    st.metric("US 10Y yield (^TNX)", f"{yield_value:.2f}" if yield_value is not None else "Unavailable")
+with m3:
+    st.metric("Gold data rows", f"{len(gold):,}")
+
+if not dxy.empty:
+    st.line_chart(dxy["Close"].tail(180), height=180)
+    st.caption("DXY daily close (latest 180 available sessions)")
+if not us10y.empty:
+    st.line_chart(us10y["Close"].tail(180), height=180)
+    st.caption("US 10-year yield proxy (^TNX), daily close")
+
+st.divider()
+
+# -------------------- Gold chart and indicators --------------------
+st.subheader("📉 Gold chart & indicators")
+gold_ind = add_indicators(gold)
+chart = gold_ind[["Close", "EMA20", "EMA50", "EMA200"]].dropna(how="all").tail(250)
+st.line_chart(chart, height=350)
+st.caption("Gold futures (GC=F) is a proxy and may differ from your broker's XAUUSD spot quote.")
+
+indicator_cols = ["Close", "EMA20", "EMA50", "EMA200", "RSI14", "MACD", "MACD_Signal", "ATR14"]
+st.dataframe(gold_ind[indicator_cols].tail(10).round(3), use_container_width=True)
+
+st.divider()
+
+# -------------------- Backtest --------------------
+st.subheader("🧪 Historical signal test")
+tested, stats = backtest_signals(gold, dxy, us10y)
+if stats:
+    b1, b2, b3 = st.columns(3)
+    b1.metric("Tested signals", stats["trades"])
+    b2.metric("Directional hit rate", f"{stats['accuracy']:.1f}%")
+    b3.metric("Average next-session return", f"{stats['avg_return']:.3f}%")
+    st.caption(
+        "Method: signal calculated using day t close; checked against day t to t+1 close return. "
+        "No transaction costs, spread, slippage, execution timing, or position sizing included. "
+        "Past results do not predict future results."
+    )
+    view = tested.tail(30).copy()
+    view["Direction"] = view["signal"].map({1: "BUY bias", -1: "SELL bias"})
+    view["Next day return %"] = (view["next_return"] * 100).round(3)
+    view["Correct?"] = view["correct"].map({True: "Yes", False: "No"})
+    st.dataframe(view[["Direction", "Next day return %", "Correct?"]], use_container_width=True)
+else:
+    st.info("Is period vich test karan layi clear BUY/SELL signals nahi mile.")
+
+st.divider()
+
+# -------------------- Concepts --------------------
+st.subheader("📚 My trading concepts")
+default_concepts = [
+    {"name": "DXY and Gold", "detail": "DXY weak hon naal Gold nu support mil sakdi hai, par relation har waqt inverse nahi hunda."},
+    {"name": "Trend confirmation", "detail": "EMA20, EMA50 te price structure nu ikathe check karo; ik indicator te depend na karo."},
+    {"name": "High-impact news", "detail": "CPI, NFP te Fed decisions de around volatility vadh sakdi hai. Paper mode vich observe karo."},
+]
+if "concepts" not in st.session_state:
+    if CONCEPTS_FILE.exists():
+        try:
+            st.session_state.concepts = json.loads(CONCEPTS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            st.session_state.concepts = default_concepts
+    else:
+        st.session_state.concepts = default_concepts
+
+with st.form("add_concept_form"):
+    new_name = st.text_input("Concept name")
+    new_detail = st.text_area("Concept detail")
+    add_concept = st.form_submit_button("Add concept")
+if add_concept:
+    if new_name.strip() and new_detail.strip():
+        st.session_state.concepts.append({"name": new_name.strip(), "detail": new_detail.strip()})
+        CONCEPTS_FILE.write_text(json.dumps(st.session_state.concepts, ensure_ascii=False, indent=2), encoding="utf-8")
+        st.success("Concept saved.")
+        st.rerun()
+    else:
+        st.error("Name te detail dono likho.")
+
+for i, concept in enumerate(st.session_state.concepts):
+    with st.expander(concept["name"]):
+        st.write(concept["detail"])
+        if st.button("Delete concept", key=f"delete_concept_{i}"):
+            st.session_state.concepts.pop(i)
+            CONCEPTS_FILE.write_text(json.dumps(st.session_state.concepts, ensure_ascii=False, indent=2), encoding="utf-8")
+            st.rerun()
+
+st.divider()
+
+# -------------------- Paper journal --------------------
+st.subheader("📝 Paper trade journal")
+with st.form("journal_form"):
+    trade_date = st.date_input("Date", value=datetime.now().date())
+    direction = st.selectbox("Paper direction", ["BUY", "SELL", "WAIT"])
+    entry = st.number_input("Planned entry price", min_value=0.0, value=0.0, format="%.2f")
+    exit_price = st.number_input("Observed exit price (optional)", min_value=0.0, value=0.0, format="%.2f")
+    reason = st.text_area("Reason / lesson")
+    save_trade = st.form_submit_button("Save paper record")
+
+if save_trade:
+    row = pd.DataFrame([{
+        "date": str(trade_date),
+        "direction": direction,
+        "planned_entry": entry,
+        "observed_exit": exit_price,
+        "reason": reason,
+    }])
+    if JOURNAL_FILE.exists():
+        row.to_csv(JOURNAL_FILE, mode="a", header=False, index=False)
+    else:
+        row.to_csv(JOURNAL_FILE, index=False)
+    st.success("Paper record saved on this computer/server.")
+
+if JOURNAL_FILE.exists():
+    journal = pd.read_csv(JOURNAL_FILE)
+    st.dataframe(journal.tail(50), use_container_width=True)
+    st.download_button(
+        "Download journal CSV",
+        data=JOURNAL_FILE.read_bytes(),
+        file_name="bota_paper_journal.csv",
+        mime="text/csv",
+    )
+else:
+    st.caption("Hale koi paper records save nahi hoye.")
+
+st.caption("BOTA PREDICTION APP v2.0 • Educational use • Not financial advice")
+[11/26, 11:14 AM] Loading....: streamlit>=1.32
+yfinance>=0.2.40
+pandas>=2.0
+numpy>=1.24
